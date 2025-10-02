@@ -1,70 +1,81 @@
-name: DbUp CI
+name: DbUp CI (SQL Server service container)
 
 on:
-  push: { branches: [ "main" ] }
+  push:
+    branches: [ "main" ]
   workflow_dispatch: {}
 
 jobs:
   migrate:
-    runs-on: ubuntu-22.04   # más simple que 24.04
+    runs-on: ubuntu-latest
 
+    # SQL Server como service container
     services:
       sqlserver:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
           ACCEPT_EULA: "Y"
           MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
-        ports: [ "1433:1433" ]
+        ports:
+          - "1433:1433"
+        # healthcheck simple a puerto 1433 para que el job no avance “en frío”
         options: >-
-          --health-cmd="bash -lc 'echo > /dev/tcp/127.0.0.1/1433 || exit 1'"
-          --health-interval=5s --health-timeout=5s --health-retries=60
-        # vars requeridas por la imagen: ACCEPT_EULA y MSSQL_SA_PASSWORD. :contentReference[oaicite:1]{index=1}
+          --health-cmd="bash -c 'echo > /dev/tcp/127.0.0.1/1433 || exit 1'"
+          --health-interval=5s --health-timeout=5s --health-retries=30
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-dotnet@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
-      # Instala sqlcmd en 22.04 (mssql-tools18) y añade al PATH
+        # Instala las herramientas de línea de comandos (sqlcmd/bcp)
       - name: Install sqlcmd (mssql-tools18)
         run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y curl apt-transport-https gnupg
-          curl https://packages.microsoft.com/keys/microsoft.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
-          echo "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg arch=amd64] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" \
-            | sudo tee /etc/apt/sources.list.d/mssql-release.list
-          sudo apt-get update
-          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18 unixodbc-dev
-          echo "/opt/mssql-tools18/bin" >> $GITHUB_PATH
-        # Guía oficial de Microsoft para instalar las tools (sqlcmd/bcp). :contentReference[oaicite:2]{index=2}
+          curl -sSL https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y mssql-tools18 unixodbc-dev
+          echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> $GITHUB_ENV
 
-      # Espera activa a que el SQL del servicio responda
+      # Espera activa a que SQL Server acepte conexiones TDS y supere el error de certificado
       - name: Wait for SQL Server to be ready
+        shell: bash
         env:
-          SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
+          SA_PWD: ${{ secrets.MSSQL_SA_PASSWORD }}
         run: |
-          set -euxo pipefail
+          export PATH="$PATH:/opt/mssql-tools18/bin"
           for i in {1..60}; do
-            /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1,1433 -U sa -P "$SA_PASSWORD" -Q "SELECT 1" && exit 0
-            echo "⏳ SQL Server starting... ($i/60)"; sleep 2
+            # -C = confiar en el certificado del servidor (mantiene cifrado)
+            # -No sería la alternativa para “modo legado” (encriptación opcional),
+            # pero preferimos -C para no desactivar TLS.
+            if sqlcmd -C -S 127.0.0.1,1433 -U sa -P "$SA_PWD" -Q "SELECT 1" -b -l 5 >/dev/null 2>&1; then
+              echo "SQL Server is ready"; break
+            fi
+            echo "SQL Server starting... ($i/60)"
+            sleep 2
           done
-          echo "SQL Server not ready in time" >&2; exit 1
+          # Si a los 60 intentos no responde, falla el job
+          sqlcmd -C -S 127.0.0.1,1433 -U sa -P "$SA_PWD" -Q "SELECT @@VERSION" -b -l 5
 
       - name: Run DbUp migrations
         env:
-          CONNECTION_STRING: "Server=127.0.0.1,1433;Initial Catalog=migraciondb;User ID=sa;Password=${{ secrets.MSSQL_SA_PASSWORD }};Encrypt=True;TrustServerCertificate=True"
-          CI: "1"
+          # Conexión hacia el contenedor (TLS activo y confiando el cert)
+          CONNECTION_STRING: >-
+            Server=127.0.0.1,1433;
+            Initial Catalog=migraciondb;
+            User ID=sa;
+            Password=${{ secrets.MSSQL_SA_PASSWORD }};
+            Encrypt=True;TrustServerCertificate=True
         run: |
-          set -euxo pipefail
           dotnet restore
           dotnet build -c Release --no-restore
           dotnet run -c Release --project ./MigradorDbUp/MigradorDbUp.csproj -- --ci 2>&1 | tee migrations.log
 
       - name: Save migration log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dbup-log
