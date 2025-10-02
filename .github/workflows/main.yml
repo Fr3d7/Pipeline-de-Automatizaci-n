@@ -1,4 +1,3 @@
-
 name: DbUp CI
 on:
   push: { branches: [ "main" ] }
