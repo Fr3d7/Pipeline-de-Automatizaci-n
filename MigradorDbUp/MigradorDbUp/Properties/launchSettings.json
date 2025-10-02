@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "MigradorDbUp": {
+      "commandName": "Project",
+      "commandLineArgs": "--include-rollback\r\n\r\n"
+    }
+  }
+}

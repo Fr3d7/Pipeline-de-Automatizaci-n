@@ -1,0 +1,34 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="dbup" Version="5.0.41" />
+    <PackageReference Include="dbup-sqlserver" Version="6.0.0" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.0-preview1.25257.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="1Creacion_Tablas\**\*.sql" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="2Insertar_Data\**\*.sql" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+<ItemGroup>
+  <Content Include="3Rollback\**\*.sql">
+    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+  </Content>
+</ItemGroup>
+
+<ItemGroup>
+ <Content Include="1Creacion_Tablas\**\*.sql" CopyToOutputDirectory="PreserveNewest" />
+  <Content Include="2Insertar_Data\**\*.sql"   CopyToOutputDirectory="PreserveNewest" />
+  <Content Include="3Rollback\**\*.sql"        CopyToOutputDirectory="PreserveNewest" />
+</ItemGroup>
+
+
+</Project>
