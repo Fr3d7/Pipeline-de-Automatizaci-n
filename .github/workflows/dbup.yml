@@ -1,43 +1,28 @@
-name: DbUp CI
+name: DbUp CI/CD
 
 on:
   push:
-    branches: [ "main" ]
-  workflow_dispatch: {}
+    branches: [ "main" ]           # CI: valida migraciones en contenedor
+  workflow_dispatch:                # CD: lo disparas a mano
 
 jobs:
   migrate:
     runs-on: ubuntu-22.04
-
     services:
       sqlserver:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
           ACCEPT_EULA: "Y"
           MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
-        ports:
-          - 1433:1433
+        ports: [ "1433:1433" ]
         options: >-
           --health-cmd="bash -c 'echo > /dev/tcp/127.0.0.1/1433 || exit 1'"
           --health-interval=10s --health-timeout=5s --health-retries=30
-
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: "8.0.x" }
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "8.0.x"
-
-      # (Opcional) lista todo para ver la estructura real del repo en el log
-      - name: Mostrar estructura del repo (debug)
-        run: |
-          pwd
-          ls -la
-          echo "------"
-          find . -maxdepth 3 -type f -name "*.csproj" -print
-
-      # Instalar ODBC18 y sqlcmd (mssql-tools18) en Ubuntu 22.04
       - name: Instalar sqlcmd / ODBC18
         run: |
           sudo apt-get update
@@ -48,54 +33,63 @@ jobs:
           sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
           echo '/opt/mssql-tools18/bin' >> $GITHUB_PATH
 
-      # Esperar SQL con sqlcmd (-C confía en el certificado del contenedor)
-      - name: Esperar a que SQL Server esté listo
-        env:
-          SA_PWD: ${{ secrets.MSSQL_SA_PASSWORD }}
-        shell: bash
+      - name: Esperar SQL
+        env: { SA_PWD: ${{ secrets.MSSQL_SA_PASSWORD }} }
         run: |
           for i in {1..90}; do
             if /opt/mssql-tools18/bin/sqlcmd -C -S 127.0.0.1,1433 -U sa -P "$SA_PWD" -Q "SELECT 1" >/dev/null 2>&1; then
-              echo "SQL listo en intento $i"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "SQL Server no quedó listo a tiempo" >&2
-          exit 1
+              echo "SQL listo"; exit 0; fi; sleep 2; done; exit 1
 
-      # Localizar automáticamente el .csproj del ejecutable DbUp
       - name: Localizar .csproj
         id: proj
         shell: bash
         run: |
-          set -e
           CSProj=$(git ls-files "*MigradorDbUp*.csproj" | head -n1)
-          if [ -z "$CSProj" ]; then
-            CSProj=$(git ls-files "*.csproj" | head -n1)
-          fi
-          if [ -z "$CSProj" ]; then
-            echo "No se encontró ningún .csproj" >&2
-            exit 1
-          fi
+          [ -z "$CSProj" ] && CSProj=$(git ls-files "*.csproj" | head -n1)
+          [ -z "$CSProj" ] && { echo "No se encontró .csproj"; exit 1; }
           echo "csproj=$CSProj" >> "$GITHUB_OUTPUT"
-          echo "Usando: $CSProj"
 
-      - name: Restaurar
-        run: dotnet restore "${{ steps.proj.outputs.csproj }}"
+      - name: Restore & Build
+        run: |
+          dotnet restore "${{ steps.proj.outputs.csproj }}"
+          dotnet build -c Release --no-restore "${{ steps.proj.outputs.csproj }}"
 
-      - name: Compilar (Release)
-        run: dotnet build -c Release --no-restore "${{ steps.proj.outputs.csproj }}"
-
-      - name: Ejecutar migraciones (DbUp)
+      - name: Ejecutar migraciones (CI)
         env:
           CONNECTION_STRING: "Server=127.0.0.1,1433;Initial Catalog=migraciondb;User ID=sa;Password=${{ secrets.MSSQL_SA_PASSWORD }};Encrypt=True;TrustServerCertificate=True"
-        run: |
-          dotnet run -c Release --project "${{ steps.proj.outputs.csproj }}" -- --ci 2>&1 | tee migrations.log
+        run: dotnet run -c Release --project "${{ steps.proj.outputs.csproj }}" -- --ci 2>&1 | tee migrations.log
 
-      - name: Guardar log de migración
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         if: always()
-        with:
-          name: dbup-log
-          path: migrations.log
+        with: { name: dbup-log, path: migrations.log }
+
+  deploy:
+    needs: migrate
+    if: github.event_name == 'workflow_dispatch'          # lo lanzas a mano
+    runs-on: ubuntu-22.04
+    environment: prod                                     # crea el environment "prod" y guarda ahí el secreto
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: "8.0.x" }
+
+      - name: Localizar .csproj
+        id: proj
+        shell: bash
+        run: |
+          CSProj=$(git ls-files "*MigradorDbUp*.csproj" | head -n1)
+          [ -z "$CSProj" ] && CSProj=$(git ls-files "*.csproj" | head -n1)
+          echo "csproj=$CSProj" >> "$GITHUB_OUTPUT"
+
+      - name: Ejecutar migraciones contra instancia persistente
+        env:
+          # Define este secreto en Settings > Environments > prod > Secrets
+          CONNECTION_STRING: ${{ secrets.CONNECTION_STRING }}
+        run: |
+          dotnet restore "${{ steps.proj.outputs.csproj }}"
+          dotnet build -c Release --no-restore "${{ steps.proj.outputs.csproj }}"
+          dotnet run -c Release --project "${{ steps.proj.outputs.csproj }}" -- --ci 2>&1 | tee deploy.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: deploy-log, path: deploy.log }
