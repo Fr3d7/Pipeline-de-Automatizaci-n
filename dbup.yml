@@ -1,1 +1,53 @@
 
+name: DbUp CI
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}   # botón “Run workflow”
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
+        ports:
+          - 1433:1433
+        # healthcheck simple para esperar a que escuche el puerto
+        options: >-
+          --health-cmd="bash -c 'echo > /dev/tcp/127.0.0.1/1433 || exit 1'"
+          --health-interval=10s --health-timeout=5s --health-retries=10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x   # recomendado por GitHub para .NET. :contentReference[oaicite:2]{index=2}
+
+      - name: Esperar a que SQL esté listo
+        run: |
+          for i in {1..30}; do
+            (echo > /dev/tcp/127.0.0.1/1433) >/dev/null 2>&1 && echo "SQL READY" && break
+            sleep 2
+          done
+
+      - name: Ejecutar migraciones (DbUp)
+        env:
+          CONNECTION_STRING: "Server=127.0.0.1,1433;Initial Catalog=migraciondb;User ID=sa;Password=${{ secrets.MSSQL_SA_PASSWORD }};Encrypt=True;TrustServerCertificate=True"
+        run: |
+          dotnet restore
+          dotnet build -c Release --no-restore
+          # AJUSTA el path si es necesario: ./MigradorDbUp/MigradorDbUp/MigradorDbUp.csproj
+          dotnet run -c Release --project ./MigradorDbUp/MigradorDbUp.csproj -- --ci | tee migrations.log
+
+      - name: Guardar evidencia (log)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbup-log
+          path: migrations.log
