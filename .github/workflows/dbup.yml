@@ -1,4 +1,5 @@
-﻿name: DbUp CI
+name: CI: DbUp con SQL Server service container
+
 on:
   push: { branches: [ "main" ] }
   workflow_dispatch: {}
@@ -6,6 +7,7 @@ on:
 jobs:
   migrate:
     runs-on: ubuntu-latest
+
     services:
       sqlserver:
         image: mcr.microsoft.com/mssql/server:2022-latest
@@ -14,13 +16,24 @@ jobs:
           MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
         ports: [ "1433:1433" ]
         options: >-
-          --health-cmd="bash -c ''echo > /dev/tcp/127.0.0.1/1433 || exit 1''"
-          --health-interval=10s --health-timeout=5s --health-retries=10
+          --health-cmd="bash -c 'echo > /dev/tcp/127.0.0.1/1433 || exit 1'"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=60
+          --health-start-period=60s
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
+
+      - name: Diagnóstico rápido
+        run: |
+          dotnet --info
+          pwd
+          ls -R
+
       - name: Ejecutar migraciones (DbUp)
         env:
           CONNECTION_STRING: "Server=127.0.0.1,1433;Initial Catalog=migraciondb;User ID=sa;Password=${{ secrets.MSSQL_SA_PASSWORD }};Encrypt=True;TrustServerCertificate=True"
@@ -28,6 +41,7 @@ jobs:
           dotnet restore
           dotnet build -c Release --no-restore
           dotnet run -c Release --project ./MigradorDbUp/MigradorDbUp.csproj -- --ci | tee migrations.log
+
       - name: Guardar evidencia (log)
         uses: actions/upload-artifact@v4
         with:
