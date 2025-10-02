@@ -7,62 +7,95 @@ on:
 
 jobs:
   migrate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
-    # SQL Server como service container
     services:
       sqlserver:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
           ACCEPT_EULA: "Y"
           MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
-        ports: [ "1433:1433" ]
-        # healthcheck con sqlcmd (ODBC 18 requiere TLS; -C confía en el certificado del contenedor)
+        ports:
+          - 1433:1433
         options: >-
-          --health-cmd="bash -lc '/opt/mssql-tools18/bin/sqlcmd -C -S 127.0.0.1,1433 -U sa -P $MSSQL_SA_PASSWORD -Q \"SELECT 1\" || exit 1'"
-          --health-interval=10s --health-timeout=3s --health-retries=60
+          --health-cmd="bash -c 'echo > /dev/tcp/127.0.0.1/1433 || exit 1'"
+          --health-interval=10s --health-timeout=5s --health-retries=30
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
-      - name: Instalar sqlcmd (mssql-tools18)
-        run: |
-          sudo apt-get update
-          sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18
-          echo '/opt/mssql-tools18/bin' >> $GITHUB_PATH
-
-      - name: Mostrar estructura para verificar rutas
+      # (Opcional) lista todo para ver la estructura real del repo en el log
+      - name: Mostrar estructura del repo (debug)
         run: |
           pwd
           ls -la
-          echo "---- ./MigradorDbUp"
-          ls -la ./MigradorDbUp || true
-          echo "---- ./MigradorDbUp/MigradorDbUp"
-          ls -la ./MigradorDbUp/MigradorDbUp || true
+          echo "------"
+          find . -maxdepth 3 -type f -name "*.csproj" -print
 
-      - name: Esperar a que SQL Server esté listo
+      # Instalar ODBC18 y sqlcmd (mssql-tools18) en Ubuntu 22.04
+      - name: Instalar sqlcmd / ODBC18
         run: |
-          for i in {1..60}; do
-            /opt/mssql-tools18/bin/sqlcmd -C -S 127.0.0.1,1433 -U sa -P '${{ secrets.MSSQL_SA_PASSWORD }}' -Q "SELECT 1" && break
-            echo "⏳ SQL Server starting... ($i/60)"; sleep 2
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y curl apt-transport-https gnupg
+          curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+          sudo add-apt-repository "$(curl -s https://packages.microsoft.com/config/ubuntu/22.04/prod.list)"
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+          echo '/opt/mssql-tools18/bin' >> $GITHUB_PATH
+
+      # Esperar SQL con sqlcmd (-C confía en el certificado del contenedor)
+      - name: Esperar a que SQL Server esté listo
+        env:
+          SA_PWD: ${{ secrets.MSSQL_SA_PASSWORD }}
+        shell: bash
+        run: |
+          for i in {1..90}; do
+            if /opt/mssql-tools18/bin/sqlcmd -C -S 127.0.0.1,1433 -U sa -P "$SA_PWD" -Q "SELECT 1" >/dev/null 2>&1; then
+              echo "SQL listo en intento $i"
+              exit 0
+            fi
+            sleep 2
           done
+          echo "SQL Server no quedó listo a tiempo" >&2
+          exit 1
+
+      # Localizar automáticamente el .csproj del ejecutable DbUp
+      - name: Localizar .csproj
+        id: proj
+        shell: bash
+        run: |
+          set -e
+          CSProj=$(git ls-files "*MigradorDbUp*.csproj" | head -n1)
+          if [ -z "$CSProj" ]; then
+            CSProj=$(git ls-files "*.csproj" | head -n1)
+          fi
+          if [ -z "$CSProj" ]; then
+            echo "No se encontró ningún .csproj" >&2
+            exit 1
+          fi
+          echo "csproj=$CSProj" >> "$GITHUB_OUTPUT"
+          echo "Usando: $CSProj"
+
+      - name: Restaurar
+        run: dotnet restore "${{ steps.proj.outputs.csproj }}"
+
+      - name: Compilar (Release)
+        run: dotnet build -c Release --no-restore "${{ steps.proj.outputs.csproj }}"
 
       - name: Ejecutar migraciones (DbUp)
+        env:
+          CONNECTION_STRING: "Server=127.0.0.1,1433;Initial Catalog=migraciondb;User ID=sa;Password=${{ secrets.MSSQL_SA_PASSWORD }};Encrypt=True;TrustServerCertificate=True"
         run: |
-          # OJO: la ruta es relativa a la raíz del repo
-          dotnet restore ./MigradorDbUp/MigradorDbUp.csproj
-          dotnet build   -c Release --no-restore ./MigradorDbUp/MigradorDbUp.csproj
-          dotnet run     -c Release --project     ./MigradorDbUp/MigradorDbUp.csproj -- --ci 2>&1 | tee migrations.log
+          dotnet run -c Release --project "${{ steps.proj.outputs.csproj }}" -- --ci 2>&1 | tee migrations.log
 
       - name: Guardar log de migración
-        if: always()
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: dbup-log
-          path: ${{ github.workspace }}/migrations.log
+          path: migrations.log
