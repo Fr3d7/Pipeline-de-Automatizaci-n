@@ -6,7 +6,7 @@ on:
 
 jobs:
   migrate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04   # más simple que 24.04
 
     services:
       sqlserver:
@@ -18,6 +18,7 @@ jobs:
         options: >-
           --health-cmd="bash -lc 'echo > /dev/tcp/127.0.0.1/1433 || exit 1'"
           --health-interval=5s --health-timeout=5s --health-retries=60
+        # vars requeridas por la imagen: ACCEPT_EULA y MSSQL_SA_PASSWORD. :contentReference[oaicite:1]{index=1}
 
     steps:
       - uses: actions/checkout@v4
@@ -26,36 +27,39 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      # Instala sqlcmd (mssql-tools18) y lo agrega al PATH
+      # Instala sqlcmd en 22.04 (mssql-tools18) y añade al PATH
       - name: Install sqlcmd (mssql-tools18)
         run: |
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y curl apt-transport-https gnupg
-          curl https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
-          echo "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg arch=amd64] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          curl https://packages.microsoft.com/keys/microsoft.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+          echo "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg arch=amd64] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" \
+            | sudo tee /etc/apt/sources.list.d/mssql-release.list
           sudo apt-get update
           sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18 unixodbc-dev
           echo "/opt/mssql-tools18/bin" >> $GITHUB_PATH
-        # Docs oficiales para sqlcmd/bcp (mssql-tools18):
-        # https://learn.microsoft.com/sql/connect/odbc/linux-mac/installing-the-microsoft-odbc-driver-for-sql-server
-        # https://learn.microsoft.com/sql/linux/sql-server-linux-setup-tools
+        # Guía oficial de Microsoft para instalar las tools (sqlcmd/bcp). :contentReference[oaicite:2]{index=2}
 
-      # Espera a que SQL Server esté listo (sin necesidad de instalar nada extra)
+      # Espera activa a que el SQL del servicio responda
       - name: Wait for SQL Server to be ready
-        shell: bash
         env:
           SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
         run: |
+          set -euxo pipefail
           for i in {1..60}; do
-            /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1,1433 -U sa -P "$SA_PASSWORD" -Q "SELECT 1" && break
+            /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1,1433 -U sa -P "$SA_PASSWORD" -Q "SELECT 1" && exit 0
             echo "⏳ SQL Server starting... ($i/60)"; sleep 2
           done
+          echo "SQL Server not ready in time" >&2; exit 1
 
       - name: Run DbUp migrations
         env:
           CONNECTION_STRING: "Server=127.0.0.1,1433;Initial Catalog=migraciondb;User ID=sa;Password=${{ secrets.MSSQL_SA_PASSWORD }};Encrypt=True;TrustServerCertificate=True"
           CI: "1"
         run: |
+          set -euxo pipefail
           dotnet restore
           dotnet build -c Release --no-restore
           dotnet run -c Release --project ./MigradorDbUp/MigradorDbUp.csproj -- --ci 2>&1 | tee migrations.log
