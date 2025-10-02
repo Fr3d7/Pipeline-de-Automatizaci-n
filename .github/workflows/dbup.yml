@@ -1,4 +1,4 @@
-name: DbUp CI (SQL Server service container)
+name: DbUp CI
 
 on:
   push:
@@ -9,72 +9,60 @@ jobs:
   migrate:
     runs-on: ubuntu-latest
 
-    # Ejecuta todos los "run:" del job dentro de la carpeta del proyecto
-    defaults:
-      run:
-        shell: bash
-        working-directory: ./MigradorDbUp  # <--- AQUÍ está tu .csproj
-
+    # SQL Server como service container
     services:
       sqlserver:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
           ACCEPT_EULA: "Y"
           MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
-        ports:
-          - "1433:1433"
+        ports: [ "1433:1433" ]
+        # healthcheck con sqlcmd (ODBC 18 requiere TLS; -C confía en el certificado del contenedor)
         options: >-
-          --health-cmd="bash -c 'echo > /dev/tcp/127.0.0.1/1433 || exit 1'"
-          --health-interval=5s --health-timeout=5s --health-retries=30
+          --health-cmd="bash -lc '/opt/mssql-tools18/bin/sqlcmd -C -S 127.0.0.1,1433 -U sa -P $MSSQL_SA_PASSWORD -Q \"SELECT 1\" || exit 1'"
+          --health-interval=10s --health-timeout=3s --health-retries=60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        # OJO: checkout corre en raíz; el defaults.run solo afecta a los pasos "run"
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
-      - name: Install sqlcmd (mssql-tools18)
+      - name: Instalar sqlcmd (mssql-tools18)
         run: |
-          curl -sSL https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc >/dev/null
-          sudo apt-get update -y
-          sudo apt-get install -y mssql-tools18 unixodbc-dev
-          echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> $GITHUB_ENV
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18
+          echo '/opt/mssql-tools18/bin' >> $GITHUB_PATH
 
-      - name: Wait for SQL Server to be ready
-        env:
-          SA_PWD: ${{ secrets.MSSQL_SA_PASSWORD }}
+      - name: Mostrar estructura para verificar rutas
         run: |
-          export PATH="$PATH:/opt/mssql-tools18/bin"
+          pwd
+          ls -la
+          echo "---- ./MigradorDbUp"
+          ls -la ./MigradorDbUp || true
+          echo "---- ./MigradorDbUp/MigradorDbUp"
+          ls -la ./MigradorDbUp/MigradorDbUp || true
+
+      - name: Esperar a que SQL Server esté listo
+        run: |
           for i in {1..60}; do
-            if sqlcmd -C -S 127.0.0.1,1433 -U sa -P "$SA_PWD" -Q "SELECT 1" -b -l 5 >/dev/null 2>&1; then
-              echo "SQL Server is ready"; break
-            fi
-            echo "SQL Server starting... ($i/60)"; sleep 2
+            /opt/mssql-tools18/bin/sqlcmd -C -S 127.0.0.1,1433 -U sa -P '${{ secrets.MSSQL_SA_PASSWORD }}' -Q "SELECT 1" && break
+            echo "⏳ SQL Server starting... ($i/60)"; sleep 2
           done
-          sqlcmd -C -S 127.0.0.1,1433 -U sa -P "$SA_PWD" -Q "SELECT @@VERSION" -b -l 5
 
-      - name: Run DbUp migrations
-        env:
-          CONNECTION_STRING: >-
-            Server=127.0.0.1,1433;
-            Initial Catalog=migraciondb;
-            User ID=sa;
-            Password=${{ secrets.MSSQL_SA_PASSWORD }};
-            Encrypt=True;TrustServerCertificate=True
+      - name: Ejecutar migraciones (DbUp)
         run: |
-          # Estamos en ./MigradorDbUp por defaults.run
-          dotnet restore ./MigradorDbUp.csproj
-          dotnet build -c Release --no-restore ./MigradorDbUp.csproj
-          dotnet run -c Release --project ./MigradorDbUp.csproj -- --ci 2>&1 | tee migrations.log
+          # OJO: la ruta es relativa a la raíz del repo
+          dotnet restore ./MigradorDbUp/MigradorDbUp.csproj
+          dotnet build   -c Release --no-restore ./MigradorDbUp/MigradorDbUp.csproj
+          dotnet run     -c Release --project     ./MigradorDbUp/MigradorDbUp.csproj -- --ci 2>&1 | tee migrations.log
 
-      - name: Save migration log
+      - name: Guardar log de migración
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dbup-log
-          # Ruta absoluta al log para evitar dudas de directorio
-          path: ${{ github.workspace }}/MigradorDbUp/migrations.log
+          path: ${{ github.workspace }}/migrations.log
