@@ -1,71 +1,66 @@
 name: DbUp CI
 
 on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch:
+  push: { branches: [ "main" ] }
+  workflow_dispatch: {}
 
 jobs:
   migrate:
-    runs-on: ubuntu-latest   # si querés evitar instalar sqlcmd, usa: ubuntu-22.04
+    runs-on: ubuntu-latest
+
     services:
       sqlserver:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
           ACCEPT_EULA: "Y"
           MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
-        ports:
-          - 1433:1433
-        # Sin healthcheck: esperaremos manualmente con sqlcmd
-        # (GitHub espera "healthy" y a veces corta antes). :contentReference[oaicite:2]{index=2}
+        ports: [ "1433:1433" ]
+        options: >-
+          --health-cmd="bash -lc 'echo > /dev/tcp/127.0.0.1/1433 || exit 1'"
+          --health-interval=5s --health-timeout=5s --health-retries=60
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: "8.0.x"
 
-      # En ubuntu-24.04 ya no viene sqlcmd; lo instalamos de forma portable
-      - name: Install sqlcmd
-        uses: potatoqualitee/mssqlsuite@v1
-        with:
-          install: sqlcmd
-        # Alternativa: fija runs-on: ubuntu-22.04 y omite este paso. :contentReference[oaicite:3]{index=3}
-
-      - name: Wait for SQL to be ready (max ~3 min)
-        shell: bash
+      # Instala sqlcmd (mssql-tools18) y lo agrega al PATH
+      - name: Install sqlcmd (mssql-tools18)
         run: |
-          set -e
-          SQLCMD=$(command -v sqlcmd || echo /opt/mssql-tools18/bin/sqlcmd) # path nuevo en imágenes recientes
-          for i in $(seq 1 90); do
-            $SQLCMD -S 127.0.0.1,1433 -U sa -P "${{ secrets.MSSQL_SA_PASSWORD }}" -Q "SELECT 1" >/dev/null 2>&1 && {
-              echo "SQL listo"; exit 0; }
-            echo "[$i/90] SQL aún no responde, reintentando..."
-            sleep 2
+          sudo apt-get update
+          sudo apt-get install -y curl apt-transport-https gnupg
+          curl https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+          echo "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg arch=amd64] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18 unixodbc-dev
+          echo "/opt/mssql-tools18/bin" >> $GITHUB_PATH
+        # Docs oficiales para sqlcmd/bcp (mssql-tools18):
+        # https://learn.microsoft.com/sql/connect/odbc/linux-mac/installing-the-microsoft-odbc-driver-for-sql-server
+        # https://learn.microsoft.com/sql/linux/sql-server-linux-setup-tools
+
+      # Espera a que SQL Server esté listo (sin necesidad de instalar nada extra)
+      - name: Wait for SQL Server to be ready
+        shell: bash
+        env:
+          SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
+        run: |
+          for i in {1..60}; do
+            /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1,1433 -U sa -P "$SA_PASSWORD" -Q "SELECT 1" && break
+            echo "⏳ SQL Server starting... ($i/60)"; sleep 2
           done
-          echo "SQL no quedó listo a tiempo"; exit 1
-        # /opt/mssql-tools18/bin/sqlcmd es la nueva ruta del binario. :contentReference[oaicite:4]{index=4}
 
       - name: Run DbUp migrations
         env:
-          CONNECTION_STRING: "Server=127.0.0.1,1433;Initial Catalog=migraciondb;User ID=sa;Password=${{ secrets.MSSQL_SA_PASSWORD }};Encrypt=True;TrustServerCertificate=True;Connect Timeout=30"
+          CONNECTION_STRING: "Server=127.0.0.1,1433;Initial Catalog=migraciondb;User ID=sa;Password=${{ secrets.MSSQL_SA_PASSWORD }};Encrypt=True;TrustServerCertificate=True"
+          CI: "1"
         run: |
           dotnet restore
           dotnet build -c Release --no-restore
           dotnet run -c Release --project ./MigradorDbUp/MigradorDbUp.csproj -- --ci 2>&1 | tee migrations.log
 
-      - name: Dump SQL errorlog on failure (always)
-        if: always()
-        run: |
-          CID=$(docker ps -q --filter "ancestor=mcr.microsoft.com/mssql/server:2022-latest" | head -n1)
-          echo "Container: $CID"
-          docker logs "$CID" --tail 200 || true
-          echo "---- /var/opt/mssql/log/errorlog (últimas líneas) ----"
-          docker exec "$CID" bash -lc "tail -n 200 /var/opt/mssql/log/errorlog" || true
-
-      - name: Save DbUp log
-        if: always()
+      - name: Save migration log
         uses: actions/upload-artifact@v4
         with:
           name: dbup-log
