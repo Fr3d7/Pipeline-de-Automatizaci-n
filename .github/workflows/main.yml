@@ -1,49 +1,52 @@
-name: DbUp CI
+# .github/workflows/dbup.yml
+name: CI: DbUp con SQL Server service container
 
 on:
   push:
-    branches: [ "main" ]     # corre en cada push a main
-  workflow_dispatch: {}       # botón "Run workflow" en Actions
+    branches: [ "main" ]
+  workflow_dispatch: {}
 
 jobs:
   migrate:
     runs-on: ubuntu-latest
 
-    # 1) SQL Server como service container (efímero para el job)
     services:
       sqlserver:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
           ACCEPT_EULA: "Y"
-          MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
+          MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }} # ya lo creaste
         ports:
-          - 1433:1433
-        # Healthcheck simple para esperar que el puerto esté listo
-        options: >-
-          --health-cmd="bash -c 'echo > /dev/tcp/127.0.0.1/1433 || exit 1'"
-          --health-interval=10s --health-timeout=5s --health-retries=10
+          - "1433:1433"
+        # 👇 IMPORTANTE: no pongas healthcheck aquí
 
     steps:
-      # 2) Traer tu repo al runner
       - uses: actions/checkout@v4
 
-      # 3) Preparar .NET (forma recomendada)
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
-      # 4) Ejecutar DbUp contra el SQL del servicio
+      # Espera activa hasta que SQL Server responda
+      - name: Esperar a SQL Server (hasta 5 min)
+        shell: bash
+        run: |
+          echo "Esperando a SQL Server (sqlcmd) ..."
+          for i in {1..60}; do
+            /opt/mssql-tools18/bin/sqlcmd -C -S 127.0.0.1,1433 -U sa -P "${{ secrets.MSSQL_SA_PASSWORD }}" -Q "SELECT 1" && exit 0
+            sleep 5
+          done
+          echo "SQL Server no respondió a tiempo"; exit 1
+
       - name: Ejecutar migraciones (DbUp)
+        shell: bash
         env:
           CONNECTION_STRING: "Server=127.0.0.1,1433;Initial Catalog=migraciondb;User ID=sa;Password=${{ secrets.MSSQL_SA_PASSWORD }};Encrypt=True;TrustServerCertificate=True"
         run: |
           dotnet restore
           dotnet build -c Release --no-restore
-          # ⬇️ Deja SOLO una línea según tu ruta real del .csproj
-          dotnet run -c Release --project ./MigradorDbUp/MigradorDbUp.csproj -- --ci | tee migrations.log
-          # dotnet run -c Release --project ./MigradorDbUp/MigradorDbUp/MigradorDbUp.csproj -- --ci | tee migrations.log
+          dotnet run -c Release --project ./MigradorDbUp/MigradorDbUp.csproj -- --ci 2>&1 | tee migrations.log
 
-      # 5) Guardar evidencia del run
       - name: Guardar evidencia (log)
         uses: actions/upload-artifact@v4
         with:
